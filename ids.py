@@ -92,6 +92,22 @@ def group_split(df, val_pct=15, seed=0):
 
 
 # ---------------------------------------------------------------- features
+def add_interactions(X, df, N):
+    # Interaction features for stealth/FIN-service gap (captures remaining FN)
+    # 1. FIN-state + missing-service pattern
+    X["fin_miss_svc"] = ((df["state"].astype(str).str.strip() == "FIN") &
+                         df["service"].astype(str).str.strip().isin(["", " ", "-"])).astype(np.float32)
+    # 2. Low-byte flow + udp
+    X["low_byte_udp"] = ((N["dur"] < 1.0) & (N["Spkts"] < 3) &
+                         (df["proto"].astype(str).str.strip() == "udp")).astype(np.float32)
+    # 3. RST + no-service (remaining edge)
+    X["rst_no_svc"] = ((df["state"].astype(str).str.strip() == "RST") &
+                       df["service"].astype(str).str.strip().isin(["", " ", "-"])).astype(np.float32)
+    # 4. Byte-rate anomaly for Fuzzers/Exploits
+    X["bytes_rate_low"] = (N["sbytes"] / (N["dur"].clip(lower=1.0) + 1e-3) < 100).astype(np.float32)
+    return X
+
+
 def build_maps(df):
     return {c: {v: i for i, v in enumerate(sorted(df[c].astype(str).unique()))}
             for c in CATS}
@@ -145,6 +161,7 @@ def design_matrix(df, maps=None, fe=True, is_train=False):
         for c in LOG1P:
             X[f"lg_{c}"] = np.log1p(N[c].clip(lower=0.0))
         X["lg_total_bytes"] = np.log1p((s + d).clip(lower=0.0))
+        add_interactions(X, df, N)
 
     return X, maps
 
@@ -194,8 +211,29 @@ def train_ensemble(X, y, seed=42, lgb_kw=None, hgb_kw=None, sw=None):
     return lgbm, hgb
 
 
-def ensemble_proba(lgbm, hgb, X):
-    return 0.5 * lgbm.predict_proba(X)[:, 1] + 0.5 * hgb.predict_proba(X)[:, 1]
+def train_catboost(X, y, seed=42, sw=None, cb_kw=None):
+    """Third blend model. Returns None (graceful) if catboost is unavailable."""
+    try:
+        from catboost import CatBoostClassifier
+    except Exception as e:
+        print(f"[catboost] unavailable, skipping 3rd model: {e}")
+        return None
+    ck = dict(iterations=500, depth=8, learning_rate=0.05, l2_leaf_reg=3.0,
+              random_seed=seed, verbose=False, allow_writing_files=False,
+              thread_count=-1)
+    if cb_kw:
+        ck.update(cb_kw)
+    cb = CatBoostClassifier(**ck)
+    cb.fit(X, y, cat_features=cat_idx(X), sample_weight=sw)
+    return cb
+
+
+def ensemble_proba(lgbm, hgb, X, alpha=0.5, cb=None):
+    if cb is not None:
+        return (0.4 * lgbm.predict_proba(X)[:, 1] +
+                0.3 * hgb.predict_proba(X)[:, 1] +
+                0.3 * cb.predict_proba(X)[:, 1])
+    return alpha * lgbm.predict_proba(X)[:, 1] + (1.0 - alpha) * hgb.predict_proba(X)[:, 1]
 
 
 # ---------------------------------------------------------------- metrics
@@ -282,12 +320,14 @@ def report(y, p, cats=None, w=20.0, th=0.5, title=""):
 class Artifact:
     """Everything predict.py needs: maps, column order, models, threshold."""
 
-    def __init__(self, maps, models, feature_cols, threshold, meta=None):
+    def __init__(self, maps, models, feature_cols, threshold, meta=None, alpha=0.5, cb=None):
         self.maps = maps
         self.lgbm, self.hgb = models
+        self.cb = cb
         self.feature_cols = list(feature_cols)
         self.threshold = float(threshold)
         self.meta = meta or {}
+        self.alpha = float(alpha)
 
     def transform(self, df, fe=True):
         X, _ = design_matrix(df, maps=self.maps, fe=fe)
@@ -295,7 +335,7 @@ class Artifact:
 
     def predict_proba(self, df):
         X = self.transform(df)
-        return ensemble_proba(self.lgbm, self.hgb, X)
+        return ensemble_proba(self.lgbm, self.hgb, X, alpha=self.alpha, cb=self.cb)
 
     def predict(self, df):
         return (self.predict_proba(df) >= self.threshold).astype(int)

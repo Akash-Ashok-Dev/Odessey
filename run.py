@@ -9,6 +9,7 @@ Subcommands:
   predict  Generate submission CSV from a saved artifact
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -138,19 +139,32 @@ def cmd_fit(a):
 
     ytr = tr_g["Label"].values
     yva = va_g["Label"].values
-    lkw = {"n_estimators": a.trees}
-    hkw = {}
+    lkw = {"n_estimators": a.trees, "num_leaves": a.leaves,
+           "learning_rate": a.lgb_lr, "min_child_samples": a.mcs}
+    hkw = {"max_iter": a.hgb_iter, "max_leaf_nodes": a.hgb_leaves,
+           "learning_rate": a.hgb_lr}
     if a.spw > 0:
         lkw["scale_pos_weight"] = a.spw
         hkw["class_weight"] = "balanced"
         print(f"[train] positive class weighting: scale_pos_weight={a.spw}")
+    sw = ids.family_weights(tr_g) if a.fam_bal else None
+    if sw is not None:
+        print(f"[train] family weights ON (mean={sw.mean():.2f}, max={sw.max():.2f})")
     t = time.time()
-    lgbm, hgb = ids.train_ensemble(Xtr, ytr, seed=42, lgb_kw=lkw, hgb_kw=hkw)
-    print(f"[train] ensemble: {time.time() - t:.1f}s")
+    lgbm, hgb = ids.train_ensemble(Xtr, ytr, seed=42, lgb_kw=lkw, hgb_kw=hkw, sw=sw)
+    cb = None
+    if a.cat:
+        t2 = time.time()
+        cb = ids.train_catboost(Xtr, ytr, seed=42, sw=sw)
+        if cb is not None:
+            print(f"[train] catboost: {time.time() - t2:.1f}s")
+    blend = ("weights lgb=0.4 hgb=0.3 cat=0.3" if cb is not None
+             else f"weights lgb=alpha={a.alpha} hgb={1 - a.alpha:.3f}")
+    print(f"[train] ensemble: {time.time() - t:.1f}s  ({blend})")
     imp = sorted(zip(Xtr.columns, lgbm.feature_importances_), key=lambda z: -z[1])
     print("[lgb  ] top features: " + ", ".join(f"{c}:{v}" for c, v in imp[:12]))
 
-    probs = ids.ensemble_proba(lgbm, hgb, Xva)
+    probs = ids.ensemble_proba(lgbm, hgb, Xva, alpha=a.alpha, cb=cb)
     ids.report(yva, probs, cats=va_g["attack_cat"].values, w=a.w, th=0.5,
                title="ENSEMBLE | group-val @0.5")
     if a.th is None:
@@ -167,7 +181,7 @@ def cmd_fit(a):
     vo = ids.load(VAL, labelled=True, nrows=100000 if a.quick else None)
     Xo, _ = ids.design_matrix(vo, maps=maps, fe=not a.no_fe)
     Xo = Xo[Xtr.columns]
-    po = ids.ensemble_proba(lgbm, hgb, Xo)
+    po = ids.ensemble_proba(lgbm, hgb, Xo, alpha=a.alpha, cb=cb)
     ids.report(vo["Label"].values, po, cats=vo["attack_cat"].values, w=a.w,
                th=0.5, title="ENSEMBLE | OFFICIAL val @0.5")
     ids.report(vo["Label"].values, po, cats=vo["attack_cat"].values, w=a.w,
@@ -176,18 +190,187 @@ def cmd_fit(a):
     op_table(yva, probs, w=a.w, title="group-val")
 
     if a.save:
-        # final artifact trained on ALL deduped train (threshold from group-val)
+        # final artifact trained on ALL train (threshold from group-val)
         Xf, mapsf = ids.design_matrix(tr, fe=not a.no_fe, is_train=True)
+        swf = ids.family_weights(tr) if a.fam_bal else None
         t = time.time()
         flgb, fhgb = ids.train_ensemble(Xf, tr["Label"].values, seed=42,
-                                        lgb_kw=lkw, hgb_kw=hkw)
+                                        lgb_kw=lkw, hgb_kw=hkw, sw=swf)
         print(f"[final] retrain on full train: {time.time() - t:.1f}s")
+        fcb = None
+        if a.cat:
+            t2 = time.time()
+            fcb = ids.train_catboost(Xf, tr["Label"].values, seed=42, sw=swf)
+            if fcb is not None:
+                print(f"[final] catboost on full train: {time.time() - t2:.1f}s")
+        params = {"alpha": a.alpha, "trees": a.trees, "leaves": a.leaves,
+                  "lgb_lr": a.lgb_lr, "mcs": a.mcs, "hgb_iter": a.hgb_iter,
+                  "hgb_leaves": a.hgb_leaves, "hgb_lr": a.hgb_lr,
+                  "cat": a.cat and fcb is not None, "fam_bal": a.fam_bal}
         art = ids.Artifact(mapsf, (flgb, fhgb), Xf.columns, th,
-                           meta={"w": a.w, "fe": not a.no_fe, "trees": a.trees,
-                                 "train_rows": len(tr)})
+                           meta={"w": a.w, "fe": not a.no_fe,
+                                 "train_rows": len(tr), **params},
+                           alpha=a.alpha, cb=fcb)
         os.makedirs(os.path.dirname(ARTIFACT), exist_ok=True)
         joblib.dump(art, ARTIFACT)
-        print(f"[save ] artifact -> {ARTIFACT} (threshold={th:.4f})")
+        blend = ("0.4/0.3/0.3" if fcb is not None else f"{a.alpha}/{1 - a.alpha:.2f}")
+        print(f"[save ] artifact -> {ARTIFACT} (threshold={th:.4f}, "
+              f"blend={blend}, feats={len(art.feature_cols)})")
+        cmd_package(a) if getattr(a, "package", False) else None
+
+
+# --------------------------------------------------------------- tune
+def cmd_tune(a):
+    """Grid search on group-val: model variants x blend weight, F1-opt objective."""
+    tr = load_train(a.quick, dedupe=a.dedupe)
+    tr_g, va_g = ids.group_split(tr, val_pct=15, seed=0)
+    Xtr, maps = ids.design_matrix(tr_g, fe=not a.no_fe, is_train=True)
+    Xva, _ = ids.design_matrix(va_g, maps=maps, fe=not a.no_fe)
+    Xva = Xva[Xtr.columns]
+    ytr = tr_g["Label"].values
+    yva = va_g["Label"].values
+    print(f"[tune ] train={len(tr_g):,} val={len(va_g):,} feats={Xtr.shape[1]}")
+
+    LGB_VARIANTS = {
+        "cur(400,64,.05,50)": {"n_estimators": 400, "num_leaves": 64,
+                               "learning_rate": 0.05, "min_child_samples": 50},
+        "big(800,255,.04,30)": {"n_estimators": 800, "num_leaves": 255,
+                                "learning_rate": 0.04, "min_child_samples": 30},
+        "deep(600,127,.03,50)": {"n_estimators": 600, "num_leaves": 127,
+                                 "learning_rate": 0.03, "min_child_samples": 50},
+        "small(400,63,.05,100)": {"n_estimators": 400, "num_leaves": 63,
+                                  "learning_rate": 0.05, "min_child_samples": 100},
+    }
+    HGB_VARIANTS = {
+        "cur(200,63,.08)": {"max_iter": 200, "max_leaf_nodes": 63,
+                            "learning_rate": 0.08},
+        "more(350,127,.05)": {"max_iter": 350, "max_leaf_nodes": 127,
+                              "learning_rate": 0.05},
+        "tight(300,63,.08,msl20)": {"max_iter": 300, "max_leaf_nodes": 63,
+                                    "learning_rate": 0.08, "min_samples_leaf": 20},
+    }
+
+    def score(p_lgb, p_hgb):
+        """Best (alpha, th, F1) on group-val; also PR-AUC at best alpha."""
+        best = None
+        for al in np.arange(0.0, 1.001, 0.1):
+            p = al * p_lgb + (1 - al) * p_hgb
+            th, m = _f1_curve(yva, p)
+            if best is None or m > best[1]:
+                from sklearn.metrics import average_precision_score
+                pr = float(average_precision_score(yva, p))
+                cm = ids.metrics(yva, p, w=a.w, th=th)
+                best = (float(al), m, th, pr, cm["cost"])
+        return best
+
+    results = []
+
+    def evaluate(tag, lkw, hkw):
+        t = time.time()
+        lgbm, hgb = ids.train_ensemble(Xtr, ytr, seed=42, lgb_kw=lkw, hgb_kw=hkw)
+        p_lgb = lgbm.predict_proba(Xva)[:, 1]
+        p_hgb = hgb.predict_proba(Xva)[:, 1]
+        al, f1, th, pr, cost = score(p_lgb, p_hgb)
+        results.append((f1, pr, cost, al, th, tag, time.time() - t))
+        print(f"[tune ] {tag:<34} F1={f1:.4f} PR-AUC={pr:.4f} "
+              f"cost={cost:,} (a={al:.1f} th={th:.3f}) "
+              f"{results[-1][-1]:.0f}s")
+
+    for name, kw in LGB_VARIANTS.items():
+        evaluate(f"LGB {name} + HGB cur", kw, HGB_VARIANTS["cur(200,63,.08)"])
+    for name, kw in HGB_VARIANTS.items():
+        if name.startswith("cur"):
+            continue
+        evaluate(f"LGB cur + HGB {name}", LGB_VARIANTS["cur(400,64,.05,50)"], kw)
+
+    results.sort(reverse=True, key=lambda r: r[0])
+    print("\n[TUNE RANKING] by group-val F1-opt")
+    print(f"  {'F1':>7} {'PR-AUC':>8} {'cost':>8} {'a':>4} {'th':>6}  config")
+    for f1, pr, cost, al, th, tag, _ in results:
+        print(f"  {f1:>7.4f} {pr:>8.4f} {cost:>8,} {al:>4.1f} {th:>6.3f}  {tag}")
+
+    # combo: retrain top-2 LGB x top-2 HGB if they differ from what we ran
+    print("\n[combo] combining best variants...")
+    top_lgb = [r[5] for r in results]
+    best_lgb_kw = None
+    for name, kw in LGB_VARIANTS.items():
+        if f"LGB {name} + HGB cur" == results[0][5]:
+            best_lgb_kw = kw
+    best_hgb_kw = None
+    for name, kw in HGB_VARIANTS.items():
+        if results[0][5].endswith(f"HGB {name}"):
+            best_hgb_kw = kw
+    if best_lgb_kw and best_hgb_kw and "cur" not in results[0][5]:
+        evaluate("COMBO best-LGB + best-HGB", best_lgb_kw, best_hgb_kw)
+        results.sort(reverse=True, key=lambda r: r[0])
+
+    w = results[0]
+    print(f"\n[WINNER] {w[5]}  F1={w[0]:.4f} a={w[3]:.1f} th={w[4]:.3f}")
+    print("run fit --save with:")
+    print(f"  .venv/bin/python run.py fit --save --alpha {w[3]:.1f} "
+          f"--th {w[4]:.4f} <params from winner tag>")
+
+
+# --------------------------------------------------------------- package
+PKG_DIR = "final_submission"
+
+
+def cmd_package(a):
+    """(Re)build the organizer package from the saved artifact."""
+    import platform
+    from importlib.metadata import version
+
+    art = joblib.load(ARTIFACT)
+    os.makedirs(PKG_DIR, exist_ok=True)
+    blob = {"lgbm": art.lgbm, "hgb": art.hgb, "cb": getattr(art, "cb", None),
+            "maps": art.maps, "feature_cols": art.feature_cols,
+            "threshold": art.threshold,
+            "fe": art.meta.get("fe", True),
+            "alpha": getattr(art, "alpha", 0.5), "meta": art.meta}
+    joblib.dump(blob, f"{PKG_DIR}/model.joblib", compress=3)
+
+    pkgs = ["scikit-learn", "lightgbm", "pandas", "numpy", "joblib", "scipy"]
+    if blob["cb"] is not None:
+        pkgs.append("catboost")
+    with open(f"{PKG_DIR}/requirements.txt", "w") as f:
+        f.write("\n".join(f"{p}=={version(p)}" for p in pkgs) + "\n")
+
+    n_feat = len(art.feature_cols)
+    has_cb = blob["cb"] is not None
+    meta = {
+        "team_name": "team_name",
+        "architecture": (
+            f"Ensemble: LightGBM ({art.meta.get('trees', '?')} trees, "
+            f"leaves={art.meta.get('leaves', '?')}, lr={art.meta.get('lgb_lr', '?')}) "
+            f"+ HistGradientBoosting ({art.meta.get('hgb_iter', '?')} iter, "
+            f"leaves={art.meta.get('hgb_leaves', '?')}, lr={art.meta.get('hgb_lr', '?')})"
+            + (f" + CatBoost (500 iter, depth=8, lr=0.05)"
+               if has_cb else "")
+            + (", blend weights 0.4/0.3/0.3 (lgb/hgb/cat)"
+               if has_cb else f", blend alpha={art.alpha}")),
+        "features": f"{n_feat} columns: 38 raw + engineered (log1p heavy-tail, "
+                    "bidirectional ratios, rates, missingness flags) + 4 interaction "
+                    "flags (fin_miss_svc, low_byte_udp, rst_no_svc, bytes_rate_low)",
+        "decision_threshold": art.threshold,
+        "threshold_rationale": art.meta.get(
+            "threshold_rationale",
+            "forced T=0.02 (cost-optimal under committee cost 40*FN+FP; "
+            "kept per team decision)"),
+        "cost_function": f"Cost = {art.meta.get('w', 40):.0f}*FN + FP "
+                         "(committee update; retune: run.py fit --save --w <W>)",
+        "training_data": "shared/data/train.csv (1,524,028 rows, group-hash split)",
+        "validation": "group-pure 85/15 split + official validation.csv confirmation",
+        "framework_versions": {p: version(p) for p in pkgs},
+        "python": platform.python_version(),
+        "model_params": {k: v for k, v in art.meta.items()
+                         if k in ("alpha", "trees", "leaves", "lgb_lr", "mcs",
+                                  "hgb_iter", "hgb_leaves", "hgb_lr",
+                                  "cat", "fam_bal")},
+    }
+    with open(f"{PKG_DIR}/metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[pkg  ] rebuilt {PKG_DIR}/ (threshold={art.threshold}, "
+          f"feats={n_feat}, catboost={'on' if has_cb else 'off'})")
 
 
 # --------------------------------------------------------------- lomo
@@ -295,8 +478,8 @@ def main():
     def common(p):
         p.add_argument("--quick", action="store_true",
                        help="subsample for fast iteration")
-        p.add_argument("--w", type=float, default=20.0,
-                       help="false-negative cost weight")
+        p.add_argument("--w", type=float, default=40.0,
+                       help="false-negative cost weight (committee: 40*FN + FP)")
         p.add_argument("--dedupe", action="store_true",
                        help="drop exact duplicate feature rows from training")
 
@@ -306,12 +489,33 @@ def main():
     p = sub.add_parser("fit", help="train ensemble + save artifact")
     common(p)
     p.add_argument("--trees", type=int, default=400)
+    p.add_argument("--leaves", type=int, default=64)
+    p.add_argument("--lgb-lr", type=float, default=0.05)
+    p.add_argument("--mcs", type=int, default=50, help="min_child_samples")
+    p.add_argument("--hgb-iter", type=int, default=200)
+    p.add_argument("--hgb-leaves", type=int, default=63)
+    p.add_argument("--hgb-lr", type=float, default=0.08)
+    p.add_argument("--alpha", type=float, default=0.5,
+                   help="LightGBM weight in ensemble blend")
     p.add_argument("--no-fe", action="store_true")
+    p.add_argument("--cat", action=argparse.BooleanOptionalAction, default=True,
+                   help="CatBoost 3rd blend model (default on)")
+    p.add_argument("--fam-bal", action=argparse.BooleanOptionalAction, default=True,
+                   help="attack-family reweighting (default on)")
     p.add_argument("--spw", type=float, default=0.0,
                    help="scale_pos_weight (0 = disabled)")
     p.add_argument("--th", type=float, default=None,
                    help="force artifact threshold (default: group-val cost-opt)")
     p.add_argument("--save", action="store_true")
+    p.add_argument("--package", action="store_true",
+                   help="rebuild final_submission/ after saving")
+
+    p = sub.add_parser("tune", help="grid search hyperparameters + blend weight")
+    common(p)
+    p.add_argument("--no-fe", action="store_true")
+
+    p = sub.add_parser("package", help="rebuild organizer package from artifact")
+    common(p)
 
     p = sub.add_parser("lomo", help="leave-one-family-out CV")
     common(p)
@@ -328,8 +532,8 @@ def main():
     p.add_argument("--output", "-o", required=True)
 
     a = ap.parse_args()
-    {"bar": cmd_bar, "fit": cmd_fit, "lomo": cmd_lomo,
-     "predict": cmd_predict}[a.cmd](a)
+    {"bar": cmd_bar, "fit": cmd_fit, "lomo": cmd_lomo, "tune": cmd_tune,
+     "package": cmd_package, "predict": cmd_predict}[a.cmd](a)
 
 
 if __name__ == "__main__":
