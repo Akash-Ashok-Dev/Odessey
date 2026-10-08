@@ -167,7 +167,10 @@ def cmd_fit(a):
     probs = ids.ensemble_proba(lgbm, hgb, Xva, alpha=a.alpha, cb=cb)
     ids.report(yva, probs, cats=va_g["attack_cat"].values, w=a.w, th=0.5,
                title="ENSEMBLE | group-val @0.5")
-    if a.th is None:
+    if a.th is None and a.objective == "f1":
+        th, _ = _f1_curve(yva, probs)
+        th_title = "ENSEMBLE | group-val F1-opt"
+    elif a.th is None:
         th, _ = ids.best_threshold(yva, probs, w=a.w)
         th_title = f"ENSEMBLE | group-val cost-opt (w={a.w:.0f})"
     else:
@@ -209,6 +212,8 @@ def cmd_fit(a):
                   "cat": a.cat and fcb is not None, "fam_bal": a.fam_bal}
         art = ids.Artifact(mapsf, (flgb, fhgb), Xf.columns, th,
                            meta={"w": a.w, "fe": not a.no_fe,
+                           "objective": a.objective,
+                           "threshold_rationale": th_title,
                                  "train_rows": len(tr), **params},
                            alpha=a.alpha, cb=fcb)
         os.makedirs(os.path.dirname(ARTIFACT), exist_ok=True)
@@ -488,24 +493,26 @@ def main():
 
     p = sub.add_parser("fit", help="train ensemble + save artifact")
     common(p)
-    p.add_argument("--trees", type=int, default=400)
-    p.add_argument("--leaves", type=int, default=64)
-    p.add_argument("--lgb-lr", type=float, default=0.05)
+    p.add_argument("--trees", type=int, default=600)
+    p.add_argument("--leaves", type=int, default=127)
+    p.add_argument("--lgb-lr", type=float, default=0.03)
     p.add_argument("--mcs", type=int, default=50, help="min_child_samples")
     p.add_argument("--hgb-iter", type=int, default=200)
     p.add_argument("--hgb-leaves", type=int, default=63)
     p.add_argument("--hgb-lr", type=float, default=0.08)
-    p.add_argument("--alpha", type=float, default=0.5,
+    p.add_argument("--alpha", type=float, default=1.0,
                    help="LightGBM weight in ensemble blend")
     p.add_argument("--no-fe", action="store_true")
     p.add_argument("--cat", action=argparse.BooleanOptionalAction, default=True,
                    help="CatBoost 3rd blend model (default on)")
-    p.add_argument("--fam-bal", action=argparse.BooleanOptionalAction, default=True,
-                   help="attack-family reweighting (default on)")
+    p.add_argument("--fam-bal", action=argparse.BooleanOptionalAction, default=False,
+                   help="attack-family reweighting (default off)")
     p.add_argument("--spw", type=float, default=0.0,
                    help="scale_pos_weight (0 = disabled)")
     p.add_argument("--th", type=float, default=None,
-                   help="force artifact threshold (default: group-val cost-opt)")
+                   help="force artifact threshold (default: selected by --objective)")
+    p.add_argument("--objective", choices=("f1", "cost"), default="f1",
+                   help="automatic threshold objective (default: f1)")
     p.add_argument("--save", action="store_true")
     p.add_argument("--package", action="store_true",
                    help="rebuild final_submission/ after saving")
@@ -531,7 +538,8 @@ def main():
     p.add_argument("--input", "-i", required=True)
     p.add_argument("--output", "-o", required=True)
 
-    a = ap.parse_args()
+    argv = sys.argv[1:] or ["fit", "--quick"]
+    a = ap.parse_args(argv)
     {"bar": cmd_bar, "fit": cmd_fit, "lomo": cmd_lomo, "tune": cmd_tune,
      "package": cmd_package, "predict": cmd_predict}[a.cmd](a)
 
