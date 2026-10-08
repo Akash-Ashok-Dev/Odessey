@@ -7,3 +7,4 @@ artifacts/*.joblib.tmp
 catboost_info/
 baseline_model.joblib
 submission_validation_baseline.csv
+shared/data/*.csv
