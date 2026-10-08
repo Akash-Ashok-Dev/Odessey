@@ -1,0 +1,19 @@
+{
+  "team_name": "team_name",
+  "architecture": "Ensemble: LightGBM 400 trees (leaves=64, lr=0.05) + HistGradientBoosting (200 iter, 63 leaves, lr=0.08), averaged probabilities",
+  "features": "38 raw + 48 engineered (log1p heavy-tail, bidirectional ratios, rates, missingness flags) = 86 columns",
+  "decision_threshold": 0.4,
+  "threshold_rationale": "F1-protected knee: F1 0.9802 (baseline 0.9773) with cost 14,781 (42% below baseline @0.5); group-val agrees (F1 0.9835 @0.4)",
+  "cost_function": "Cost = 20*FN + FP (default w=20; retune with run.py fit --save --w <W>)",
+  "training_data": "shared/data/train.csv (1,524,028 rows, group-hash split for validation)",
+  "validation": "group-pure 85/15 split + official validation.csv confirmation",
+  "framework_versions": {
+    "scikit-learn": "1.9.1",
+    "lightgbm": "4.7.0",
+    "pandas": "3.0.6",
+    "numpy": "2.5.3",
+    "joblib": "1.6.0",
+    "scipy": "1.18.1"
+  },
+  "python": "3.13.13"
+}
